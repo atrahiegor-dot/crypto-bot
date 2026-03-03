@@ -4,7 +4,9 @@ import aiohttp
 import hashlib
 import hmac
 import time
+import json
 from datetime import datetime
+from urllib.parse import urlencode
 
 logger = logging.getLogger(__name__)
 
@@ -17,71 +19,93 @@ RSI_OVERSOLD = 35
 RSI_OVERBOUGHT = 65
 
 
-def make_sign_v5(api_secret, timestamp, api_key, recv_window, body):
-    param_str = str(timestamp) + api_key + str(recv_window) + body
-    return hmac.new(api_secret.encode('utf-8'), param_str.encode('utf-8'), hashlib.sha256).hexdigest()
+def make_sign_v5(api_secret: str, timestamp: str, api_key: str, recv_window: str, body: str) -> str:
+    """Bybit v5 підпис: timestamp + api_key + recv_window + body/queryString"""
+    param_str = timestamp + api_key + recv_window + body
+    return hmac.new(
+        api_secret.encode('utf-8'),
+        param_str.encode('utf-8'),
+        hashlib.sha256
+    ).hexdigest()
 
 
-async def bybit_get_signed(endpoint, params=None):
-    if params is None:
-        params = {}
-    timestamp = str(int(time.time() * 1000))
-    recv_window = '5000'
-    query_string = '&'.join([f'{k}={v}' for k, v in params.items()])
-    sign = make_sign_v5(BYBIT_API_SECRET, timestamp, BYBIT_API_KEY, recv_window, query_string)
-    headers = {
+def build_headers(timestamp: str, sign: str, recv_window: str) -> dict:
+    return {
         'X-BAPI-API-KEY': BYBIT_API_KEY,
         'X-BAPI-TIMESTAMP': timestamp,
         'X-BAPI-SIGN': sign,
         'X-BAPI-RECV-WINDOW': recv_window,
     }
+
+
+async def bybit_get_signed(endpoint: str, params: dict = None) -> dict:
+    """
+    GET з підписом для Bybit v5.
+    ФІКС: query_string формується через urlencode і передається напряму в URL,
+    щоб порядок параметрів був однаковий і в підписі, і в запиті.
+    """
+    if params is None:
+        params = {}
+
+    timestamp = str(int(time.time() * 1000))
+    recv_window = '5000'
+    query_string = urlencode(params)
+    sign = make_sign_v5(BYBIT_API_SECRET, timestamp, BYBIT_API_KEY, recv_window, query_string)
+    headers = build_headers(timestamp, sign, recv_window)
+
     url = BYBIT_BASE + endpoint
+    if query_string:
+        url = url + '?' + query_string
+
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(url, params=params, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                return await resp.json()
+            async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                data = await resp.json()
+                if data.get('retCode') not in (0, None):
+                    logger.warning(f'GET {endpoint} retCode={data.get("retCode")} msg={data.get("retMsg")}')
+                return data
     except Exception as e:
-        logger.error(f'GET signed error: {e}')
+        logger.error(f'GET signed error [{endpoint}]: {e}')
         return {}
 
 
-async def bybit_post_signed(endpoint, body_dict):
-    import json
+async def bybit_post_signed(endpoint: str, body_dict: dict) -> dict:
+    """POST з підписом для Bybit v5."""
     timestamp = str(int(time.time() * 1000))
     recv_window = '5000'
     body_str = json.dumps(body_dict)
     sign = make_sign_v5(BYBIT_API_SECRET, timestamp, BYBIT_API_KEY, recv_window, body_str)
     headers = {
-        'X-BAPI-API-KEY': BYBIT_API_KEY,
-        'X-BAPI-TIMESTAMP': timestamp,
-        'X-BAPI-SIGN': sign,
-        'X-BAPI-RECV-WINDOW': recv_window,
+        **build_headers(timestamp, sign, recv_window),
         'Content-Type': 'application/json',
     }
     url = BYBIT_BASE + endpoint
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(url, data=body_str, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                return await resp.json()
+                data = await resp.json()
+                if data.get('retCode') != 0:
+                    logger.warning(f'POST {endpoint} retCode={data.get("retCode")} msg={data.get("retMsg")}')
+                return data
     except Exception as e:
-        logger.error(f'POST signed error: {e}')
+        logger.error(f'POST signed error [{endpoint}]: {e}')
         return {}
 
 
-async def bybit_get_public(endpoint, params=None):
+async def bybit_get_public(endpoint: str, params: dict = None) -> dict:
     url = BYBIT_BASE + endpoint
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=15)) as resp:
                 return await resp.json()
     except Exception as e:
-        logger.error(f'GET public error: {e}')
+        logger.error(f'GET public error [{endpoint}]: {e}')
         return {}
 
 
-async def get_balance():
+async def get_balance() -> dict:
     data = await bybit_get_signed('/v5/account/wallet-balance', {'accountType': 'UNIFIED'})
-    logger.info(f'Balance response: {data}')
+    logger.info(f'Balance: retCode={data.get("retCode")}, retMsg={data.get("retMsg")}')
     try:
         coins = data['result']['list'][0]['coin']
         result = {}
@@ -93,22 +117,22 @@ async def get_balance():
                 }
         return result
     except Exception as e:
-        logger.error(f'Balance parse error: {e}')
+        logger.error(f'Balance parse error: {e} | raw: {data}')
         return {}
 
 
-async def get_klines(symbol, interval='60', limit=50):
+async def get_klines(symbol: str, interval: str = '60', limit: int = 50) -> list:
     data = await bybit_get_public('/v5/market/kline', {
-        'category': 'spot', 'symbol': symbol,
-        'interval': interval, 'limit': limit
+        'category': 'spot', 'symbol': symbol, 'interval': interval, 'limit': limit
     })
     try:
         return [float(k[4]) for k in reversed(data['result']['list'])]
-    except Exception:
+    except Exception as e:
+        logger.error(f'Klines parse error: {e}')
         return []
 
 
-async def get_price(symbol):
+async def get_price(symbol: str) -> float:
     data = await bybit_get_public('/v5/market/tickers', {'category': 'spot', 'symbol': symbol})
     try:
         return float(data['result']['list'][0]['lastPrice'])
@@ -116,10 +140,10 @@ async def get_price(symbol):
         return 0.0
 
 
-def calc_rsi(prices, period=14):
+def calc_rsi(prices: list, period: int = 14) -> float:
     if len(prices) < period + 1:
         return 50.0
-    deltas = [prices[i] - prices[i-1] for i in range(1, len(prices))]
+    deltas = [prices[i] - prices[i - 1] for i in range(1, len(prices))]
     gains = [d for d in deltas if d > 0]
     losses = [-d for d in deltas if d < 0]
     if not gains: return 0.0
@@ -130,28 +154,25 @@ def calc_rsi(prices, period=14):
     return 100 - (100 / (1 + avg_gain / avg_loss))
 
 
-async def place_order(side, symbol, qty):
-    body = {
-        'category': 'spot',
-        'symbol': symbol,
-        'side': side,
-        'orderType': 'Market',
-        'qty': qty
-    }
+async def place_order(side: str, symbol: str, qty: str) -> dict:
+    body = {'category': 'spot', 'symbol': symbol, 'side': side, 'orderType': 'Market', 'qty': qty}
+    logger.info(f'Order: {side} {qty} {symbol}')
     return await bybit_post_signed('/v5/order/create', body)
 
 
-async def run_bybit_trading_cycle():
+async def run_bybit_trading_cycle() -> list:
     trades = []
     prices = await get_klines(TRADE_SYMBOL)
     if not prices:
-        logger.warning('Не удалось получить свечи')
+        logger.warning('Не вдалось отримати свічки')
         return []
+
     rsi = calc_rsi(prices)
     price = await get_price(TRADE_SYMBOL)
     balance = await get_balance()
     btc_balance = balance.get('BTC', {}).get('balance', 0.0)
-    logger.info(f'BTC: ${price:,.2f} | RSI: {rsi:.1f} | BTC: {btc_balance:.6f}')
+    logger.info(f'BTC: ${price:,.2f} | RSI: {rsi:.1f} | BTC баланс: {btc_balance:.6f}')
+
     if rsi < RSI_OVERSOLD and btc_balance < 0.0001:
         result = await place_order('Buy', TRADE_SYMBOL, TRADE_QTY)
         if result.get('retCode') == 0:
@@ -159,7 +180,8 @@ async def run_bybit_trading_cycle():
                 'order_id': result.get('result', {}).get('orderId', ''),
                 'time': datetime.now().strftime('%d.%m %H:%M')})
         else:
-            logger.error(f'Ошибка покупки: {result}')
+            logger.error(f'Помилка покупки: {result.get("retCode")} — {result.get("retMsg")}')
+
     elif rsi > RSI_OVERBOUGHT and btc_balance >= 0.001:
         qty = str(round(btc_balance, 3))
         result = await place_order('Sell', TRADE_SYMBOL, qty)
@@ -168,38 +190,28 @@ async def run_bybit_trading_cycle():
                 'order_id': result.get('result', {}).get('orderId', ''),
                 'time': datetime.now().strftime('%d.%m %H:%M')})
         else:
-            logger.error(f'Ошибка продажи: {result}')
+            logger.error(f'Помилка продажу: {result.get("retCode")} — {result.get("retMsg")}')
+
     return trades
 
 
-def format_bybit_trade(trade):
+def format_bybit_trade(trade: dict) -> str:
     if trade['type'] == 'BUY':
-        return (
-            '*BYBIT TESTNET*\n'
-            '*ПОКУПКА BTC*\n'
-            f"Цена: `${trade['price']:,.2f}`\n"
-            f"Куплено: `{trade['qty']} BTC`\n"
-            f"RSI: `{trade['rsi']:.1f}` перепродан\n"
-            f"Order: `{trade['order_id']}`\n"
-            f"Время: {trade['time']}"
-        )
-    return (
-        '*BYBIT TESTNET*\n'
-        '*ПРОДАЖА BTC*\n'
-        f"Цена: `${trade['price']:,.2f}`\n"
-        f"Продано: `{trade['qty']} BTC`\n"
-        f"RSI: `{trade['rsi']:.1f}` перекуплен\n"
-        f"Order: `{trade['order_id']}`\n"
-        f"Время: {trade['time']}"
-    )
+        return (f'*BYBIT TESTNET*\n*🟢 ПОКУПКА BTC*\n'
+                f"Ціна: `${trade['price']:,.2f}`\nКуплено: `{trade['qty']} BTC`\n"
+                f"RSI: `{trade['rsi']:.1f}` — перепроданий\nOrder: `{trade['order_id']}`\nЧас: {trade['time']}")
+    return (f'*BYBIT TESTNET*\n*🔴 ПРОДАЖ BTC*\n'
+            f"Ціна: `${trade['price']:,.2f}`\nПродано: `{trade['qty']} BTC`\n"
+            f"RSI: `{trade['rsi']:.1f}` — перекуплений\nOrder: `{trade['order_id']}`\nЧас: {trade['time']}")
 
 
-async def format_bybit_portfolio():
+async def format_bybit_portfolio() -> str:
     balance = await get_balance()
     price = await get_price(TRADE_SYMBOL)
-    lines = ['*BYBIT TESTNET — ДЕМО ПОРТФОЛИО*', '━━━━━━━━━━━━━━━━━━━━━━']
+    lines = ['*BYBIT TESTNET — ДЕМО ПОРТФОЛІО*', '━━━━━━━━━━━━━━━━━━━━━━']
     if not balance:
-        lines.append('Баланс недоступен — проверь API ключи')
+        lines.append('⚠️ Баланс недоступний — перевір API ключі')
+        lines.append(f'BTC ціна: `${price:,.2f}`')
         return '\n'.join(lines)
     total = 0
     for coin, d in balance.items():
@@ -207,7 +219,7 @@ async def format_bybit_portfolio():
         total += usd
         lines.append(f"*{coin}*: `{d['balance']:.4f}` = `${usd:,.2f}`")
     lines.append('━━━━━━━━━━━━━━━━━━━━━━')
-    lines.append(f'Итого: `${total:,.2f}`')
-    lines.append(f'BTC цена: `${price:,.2f}`')
-    lines.append(f'Стратегия RSI: покупка <{RSI_OVERSOLD} / продажа >{RSI_OVERBOUGHT}')
+    lines.append(f'Всього: `${total:,.2f}`')
+    lines.append(f'BTC ціна: `${price:,.2f}`')
+    lines.append(f'Стратегія RSI: покупка <{RSI_OVERSOLD} / продаж >{RSI_OVERBOUGHT}')
     return '\n'.join(lines)

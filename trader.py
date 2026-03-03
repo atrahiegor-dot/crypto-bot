@@ -113,7 +113,7 @@ COIN_SYMBOLS = {
 }
 
 
-def execute_buy(state: dict, coin_id: str, price: float, rsi: float) -> dict | None:
+def execute_buy(state: dict, coin_id: str, price: float, rsi: float):
     """Покупаем монету"""
     symbol = COIN_SYMBOLS.get(coin_id, coin_id.upper())
     spend_usd = state["balance_usd"] * TRADE_AMOUNT_PCT
@@ -150,7 +150,7 @@ def execute_buy(state: dict, coin_id: str, price: float, rsi: float) -> dict | N
     return trade
 
 
-def execute_sell(state: dict, coin_id: str, price: float, rsi: float) -> dict | None:
+def execute_sell(state: dict, coin_id: str, price: float, rsi: float):
     """Продаём монету"""
     symbol = COIN_SYMBOLS.get(coin_id, coin_id.upper())
 

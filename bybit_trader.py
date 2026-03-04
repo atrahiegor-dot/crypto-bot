@@ -12,29 +12,23 @@ logger = logging.getLogger(__name__)
 
 BINANCE_API_KEY    = os.getenv('BINANCE_API_KEY', '')
 BINANCE_API_SECRET = os.getenv('BINANCE_API_SECRET', '')
-BINANCE_BASE       = 'https://testnet.binance.vision'   # Binance Spot Testnet
+BINANCE_BASE       = 'https://testnet.binance.vision'
 
-TRADE_SYMBOL  = 'BTCUSDT'
-TRADE_QTY     = '0.001'          # 0.001 BTC за сделку
-RSI_OVERSOLD  = 35
+TRADE_SYMBOL   = 'BTCUSDT'
+TRADE_QTY      = '0.001'
+RSI_OVERSOLD   = 35
 RSI_OVERBOUGHT = 65
 
 
-# ──────────────────────────────────────────
-#  ПОДПИСЬ BINANCE (HMAC-SHA256)
-# ──────────────────────────────────────────
 def _sign(secret: str, params: dict) -> str:
     query = urlencode(params)
-    return hmac.new(secret.encode(), query.encode(), hashlib.sha256).hexdigest()
+    return hmac.new(secret.encode('utf-8'), query.encode('utf-8'), hashlib.sha256).hexdigest()
 
 
 def _auth_headers() -> dict:
     return {'X-MBX-APIKEY': BINANCE_API_KEY}
 
 
-# ──────────────────────────────────────────
-#  HTTP ХЕЛПЕРЫ
-# ──────────────────────────────────────────
 async def binance_get_signed(endpoint: str, params: dict = None):
     params = params or {}
     params['timestamp'] = int(time.time() * 1000)
@@ -45,7 +39,10 @@ async def binance_get_signed(endpoint: str, params: dict = None):
         async with aiohttp.ClientSession() as s:
             async with s.get(url, params=params, headers=_auth_headers(),
                              timeout=aiohttp.ClientTimeout(total=15)) as r:
-                return await r.json()
+                text = await r.text()
+                logger.info(f'[{endpoint}] status={r.status} body={text[:300]}')
+                import json
+                return json.loads(text)
     except Exception as e:
         logger.error(f'GET signed error: {e}')
         return {}
@@ -61,7 +58,10 @@ async def binance_post_signed(endpoint: str, params: dict = None):
         async with aiohttp.ClientSession() as s:
             async with s.post(url, params=params, headers=_auth_headers(),
                               timeout=aiohttp.ClientTimeout(total=15)) as r:
-                return await r.json()
+                text = await r.text()
+                logger.info(f'[{endpoint}] status={r.status} body={text[:300]}')
+                import json
+                return json.loads(text)
     except Exception as e:
         logger.error(f'POST signed error: {e}')
         return {}
@@ -73,22 +73,19 @@ async def binance_get_public(endpoint: str, params: dict = None):
         async with aiohttp.ClientSession() as s:
             async with s.get(url, params=params,
                              timeout=aiohttp.ClientTimeout(total=15)) as r:
-                return await r.json()
+                import json
+                return json.loads(await r.text())
     except Exception as e:
         logger.error(f'GET public error: {e}')
         return {}
 
 
-# ──────────────────────────────────────────
-#  РЫНОЧНЫЕ ДАННЫЕ
-# ──────────────────────────────────────────
 async def get_klines(symbol: str, interval: str = '1h', limit: int = 50) -> list:
-    """Возвращает список цен закрытия"""
     data = await binance_get_public('/api/v3/klines', {
         'symbol': symbol, 'interval': interval, 'limit': limit
     })
     try:
-        return [float(k[4]) for k in data]   # индекс 4 = close price
+        return [float(k[4]) for k in data]
     except Exception:
         return []
 
@@ -101,25 +98,21 @@ async def get_price(symbol: str) -> float:
         return 0.0
 
 
-# ──────────────────────────────────────────
-#  БАЛАНС
-# ──────────────────────────────────────────
 async def get_balance() -> dict:
+    logger.info(f'KEY задан: {bool(BINANCE_API_KEY)} | SECRET задан: {bool(BINANCE_API_SECRET)}')
     data = await binance_get_signed('/api/v3/account')
-    logger.info(f'Balance response keys: {list(data.keys()) if isinstance(data, dict) else data}')
     try:
         result = {}
         for asset in data.get('balances', []):
-            free  = float(asset['free'])
+            free   = float(asset['free'])
             locked = float(asset['locked'])
-            total = free + locked
+            total  = free + locked
             if total > 0:
                 result[asset['asset']] = {
                     'balance': total,
                     'free': free,
-                    'usd': 0.0    # заполним ниже для BTC
+                    'usd': 0.0
                 }
-        # Считаем USD-стоимость BTC
         if 'BTC' in result:
             price = await get_price(TRADE_SYMBOL)
             result['BTC']['usd'] = result['BTC']['balance'] * price
@@ -129,9 +122,6 @@ async def get_balance() -> dict:
         return {}
 
 
-# ──────────────────────────────────────────
-#  RSI
-# ──────────────────────────────────────────
 def calc_rsi(prices: list, period: int = 14) -> float:
     if len(prices) < period + 1:
         return 50.0
@@ -146,68 +136,46 @@ def calc_rsi(prices: list, period: int = 14) -> float:
     return 100 - (100 / (1 + avg_gain / avg_loss))
 
 
-# ──────────────────────────────────────────
-#  ОРДЕРА
-# ──────────────────────────────────────────
 async def place_order(side: str, symbol: str, qty: str) -> dict:
     return await binance_post_signed('/api/v3/order', {
         'symbol':   symbol,
-        'side':     side,        # BUY / SELL
+        'side':     side,
         'type':     'MARKET',
         'quantity': qty,
     })
 
 
-# ──────────────────────────────────────────
-#  ГЛАВНЫЙ ЦИКЛ ТОРГОВЛИ
-# ──────────────────────────────────────────
 async def run_bybit_trading_cycle() -> list:
-    """Название функции сохранено для совместимости с bot.py"""
     trades = []
-
     prices = await get_klines(TRADE_SYMBOL)
     if not prices:
         logger.warning('Не удалось получить свечи Binance')
         return []
-
-    rsi   = calc_rsi(prices)
-    price = await get_price(TRADE_SYMBOL)
+    rsi     = calc_rsi(prices)
+    price   = await get_price(TRADE_SYMBOL)
     balance = await get_balance()
     btc_balance = balance.get('BTC', {}).get('balance', 0.0)
-
     logger.info(f'BTC: ${price:,.2f} | RSI: {rsi:.1f} | BTC баланс: {btc_balance:.6f}')
-
     if rsi < RSI_OVERSOLD and btc_balance < 0.0001:
         result = await place_order('BUY', TRADE_SYMBOL, TRADE_QTY)
-        logger.info(f'BUY result: {result}')
         if 'orderId' in result:
-            trades.append({
-                'type': 'BUY', 'price': price, 'qty': TRADE_QTY,
+            trades.append({'type': 'BUY', 'price': price, 'qty': TRADE_QTY,
                 'rsi': rsi, 'order_id': str(result['orderId']),
-                'time': datetime.now().strftime('%d.%m %H:%M')
-            })
+                'time': datetime.now().strftime('%d.%m %H:%M')})
         else:
             logger.error(f'Ошибка покупки: {result}')
-
     elif rsi > RSI_OVERBOUGHT and btc_balance >= 0.001:
         qty = str(round(btc_balance, 3))
         result = await place_order('SELL', TRADE_SYMBOL, qty)
-        logger.info(f'SELL result: {result}')
         if 'orderId' in result:
-            trades.append({
-                'type': 'SELL', 'price': price, 'qty': qty,
+            trades.append({'type': 'SELL', 'price': price, 'qty': qty,
                 'rsi': rsi, 'order_id': str(result['orderId']),
-                'time': datetime.now().strftime('%d.%m %H:%M')
-            })
+                'time': datetime.now().strftime('%d.%m %H:%M')})
         else:
             logger.error(f'Ошибка продажи: {result}')
-
     return trades
 
 
-# ──────────────────────────────────────────
-#  ФОРМАТИРОВАНИЕ СООБЩЕНИЙ (совместимость с bot.py)
-# ──────────────────────────────────────────
 def format_bybit_trade(trade: dict) -> str:
     if trade['type'] == 'BUY':
         return (
@@ -234,18 +202,16 @@ async def format_bybit_portfolio() -> str:
     balance = await get_balance()
     price   = await get_price(TRADE_SYMBOL)
     lines   = ['*BINANCE TESTNET — ДЕМО ПОРТФОЛИО*', '━━━━━━━━━━━━━━━━━━━━━━']
-
     if not balance:
-        lines.append('Баланс недоступен — проверь API ключи Binance Testnet')
-        lines.append('Ключи берутся на: testnet.binance.vision')
+        lines.append('❌ Баланс недоступен')
+        lines.append(f'KEY задан: {"да" if BINANCE_API_KEY else "НЕТ"} | SECRET задан: {"да" if BINANCE_API_SECRET else "НЕТ"}')
+        lines.append('Проверь Railway Variables: BINANCE\\_API\\_KEY и BINANCE\\_API\\_SECRET')
         return '\n'.join(lines)
-
     total = 0.0
     for coin, d in balance.items():
         usd = d['usd'] if d['usd'] > 0 else d['balance']
         total += usd
         lines.append(f"*{coin}*: `{d['balance']:.6f}` ≈ `${usd:,.2f}`")
-
     lines.append('━━━━━━━━━━━━━━━━━━━━━━')
     lines.append(f'Итого: `${total:,.2f}`')
     lines.append(f'BTC цена: `${price:,.2f}`')
